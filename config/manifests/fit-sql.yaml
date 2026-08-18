@@ -1,0 +1,121 @@
+# MCP server for fit-scoring: the scores view.
+#
+# Carries the SAME data policy as creator-sql. Policies attach per server, and
+# the scores view also carries email and phone — apply it to one and forget the
+# other and contact details leak through here.
+#
+# A manifest is a `rpai mcp get <name> -o yaml` dump — the resource itself, led
+# by @type. `rpai mcp apply` creates it if absent, otherwise updates only the
+# fields present here that differ from live.
+#
+# Two settings matter. Please don't tidy them away:
+#
+#   rowFormat: ROW_FORMAT_OBJECT
+#     The default returns each row as a positional array, addressed by index.
+#     Data-policy rules address fields by name, so under the default the only
+#     thing they can reach is the whole row and per-column masking cannot be
+#     expressed at all. Every rule in data_policies below needs this.
+#
+#   responseFormat: MCP_RESPONSE_FORMAT_TOON
+#     Packs table results into a denser form and drops a duplicate copy the
+#     server otherwise sends. On a 15-row query: 7,330 -> 1,244 bytes. Lossless.
+#     Saves cost and context, not time — elapsed time tracks how much the model
+#     writes, not how much it reads.
+#
+# allowed_schemas is set here but not enforced: a server scoped
+# to one schema still reads others. The real boundary is the database grant in
+# config/sql/03-roles.sql, which `make prove-grants` tests. readonly,
+# max_rows_limit and blocked_patterns in the same block are enforced.
+#
+# __CONTRACTOR_EMAIL__ is substituted at apply time from env/<env>.env.
+
+# response_format is deliberately set to UNSPECIFIED, not left out.
+#
+# MCP_RESPONSE_FORMAT_TOON packs rows into a positional grid and cuts the payload
+# substantially. It also makes the model align values to a header itself, and the
+# two orderings in the payload disagree: `columns` keeps SQL order while the
+# record key list is alphabetised. The agent then quotes the wrong column's
+# value — a conversions count reported as a creator id, for instance. The plain
+# encoding keys every value explicitly and has no such failure.
+#
+# It does not reduce elapsed time either: that tracks how much the model writes,
+# not how much it reads.
+#
+# Written explicitly rather than omitted, because apply leaves fields a manifest
+# does not name untouched — deleting the line would not turn it off.
+
+'@type': type.googleapis.com/redpanda.api.adp.v1alpha1.MCPServer
+response_format: MCP_RESPONSE_FORMAT_UNSPECIFIED
+name: fit-sql
+type: MCP_SERVER_TYPE_MANAGED
+enabled: true
+description: Fit scores, for fit-scoring
+
+managed:
+  config:
+    '@type': type.googleapis.com/redpanda.mcps.sql.v1.SQLMCPConfig
+    driver: postgres
+    # An interpolation expression, not the secret's name. A bare name makes the
+    # driver try to parse it as a connection string and every attempt to connect
+    # returns HTTP 500 with no hint why.
+    dsn: ${secrets.PG_FIT_DSN}
+    row_format: ROW_FORMAT_OBJECT
+    connection_pool:
+      max_open_conns: 5
+      max_idle_conns: 2
+    guardrails:
+      readonly: true
+      # Not a performance setting. At 15 the scout only sees creators that
+      # already pass and reports no exclusions, which is the most useful part
+      # of its answer.
+      max_rows_default: 60
+      max_rows_limit: 500
+      query_timeout: 20s
+      allowed_schemas: [fit]
+      blocked_patterns:
+        - '(?i)\bDROP\b'
+        - '(?i)\bTRUNCATE\b'
+        - '(?i)\bALTER\b'
+
+# What a restricted user sees. Applies to one named person: group targeting is
+# unsupported and refuses every call on the whole server, not just the group's.
+data_policies:
+  - display_name: Agency contractor — restricted creator access
+    tools: [query]
+    principals:
+      - User:__CONTRACTOR_EMAIL__
+    shaping:
+      request:
+        clamps:
+          - json_path: $.max_rows
+            maximum: 25
+      response:
+        # Compares text, not numbers. The SQL server sends every value as a
+        # string, so `>= 8` matches nothing and — filters failing closed — that
+        # drops every row. `>= "8"` sorts alphabetically, putting "10" below
+        # "8". Hence a text flag compared with ==.
+        row_filters:
+          - path: $.records
+            expression: '@.safety_tier == "approved"'
+        field_actions:
+          default_drop: false
+          rules:
+            # absence_safe false: if the column is renamed the call fails rather
+            # than passing the address through under a new name.
+            - selector:
+                json_path: $.records.email
+              mask:
+                redact:
+                  placeholder: '[redacted]'
+              absence_safe: false
+            - selector:
+                json_path: $.records.phone
+              mask:
+                partial:
+                  keep_last: 4
+                  mask_char: '*'
+              absence_safe: true
+            - selector:
+                json_path: $.records.lifetime_gmv_usd
+              drop: {}
+              absence_safe: true

@@ -1,0 +1,12 @@
+env/secrets.env
+env/integration.env
+env/production.env
+*.env.local
+.state/
+.DS_Store
+.idea/
+.vscode/
+*.bak
+*.tmp
+__pycache__/
+*.pyc
